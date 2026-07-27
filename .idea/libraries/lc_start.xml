@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="lc-start">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/deploy/backend/lc-start.jar!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

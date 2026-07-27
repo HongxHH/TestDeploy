@@ -1,5 +1,3 @@
-# landcheck 部署包（TestDeploy）
-
 访问地址：**http://localhost:8090/**
 
 
@@ -51,16 +49,23 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 
 ## 日常运维
 
-### 命令速查
+### 一键操作（推荐，双击即可）
+
+| 做什么 | 文件 |
+|--------|------|
+| **重新构建**（停服务 → 拉代码 → 构建前后端 → 启动） | `重新构建.bat` |
+| **重新启动**（停后端 → 等 OCR → 启动） | `重新启动.bat` |
+| **设置开机自启**（登录后固定延迟 **2 分钟**） | `设置开机自启.bat` |
+| **取消开机自启** | `取消开机自启.bat` |
+
+防呆说明：同一时间只允许一个运维任务（重建/重启/自启设置互斥）；重复双击会提示「另一项运维操作正在进行中」。窗口结束前会 `pause`，方便查看结果。
+
+### 命令速查（PowerShell）
 
 | 做什么 | 命令 |
 |--------|------|
-| 检查是否有新版本 | `scripts\check-updates.ps1` |
-| **应用远程新代码** | `scripts\deploy.ps1` |
-| 强制重新构建（无视版本检测） | `scripts\deploy.ps1 -Force` |
-| 只更新后端 / 前端 | `scripts\deploy.ps1 -BackendOnly` / `-FrontendOnly` |
-| 重启全部服务 | `scripts\start-all.ps1` |
-| 快速重启（不等 OCR） | `scripts\start-all.ps1 -SkipOcrWait` |
+| **应用远程新代码（前后端强制重建）** | `scripts\deploy.ps1` |
+| 重启全部服务（等待 OCR） | `scripts\start-all.ps1` |
 | 查看运行状态与版本 | `scripts\status.ps1` |
 | 停止后端 | `scripts\stop-all.ps1` |
 | 停止后端 + Docker | `scripts\stop-all.ps1 -IncludeDocker` |
@@ -68,95 +73,36 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 
 ### 仓库有新代码时怎么更新
 
-**首次部署用 `setup.ps1`，之后更新一律用 `deploy.ps1`，不必再跑 setup。**
+**首次部署用 `setup.ps1`，之后更新一律用 `deploy.ps1`（或双击 `重新构建.bat`），不必再跑 setup。**
 
 ```powershell
 cd D:\landcheck\TestDeploy
 
-# 可选：先看远程是否有新 commit
-powershell -ExecutionPolicy Bypass -File scripts\check-updates.ps1
-
-# 拉取 → 构建 → 替换 deploy/ → 重启
+# 拉取 → 构建前后端 → 替换 deploy/ → 重启（每次均强制重建）
 powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
 ```
 
 流程说明：
 
-1. 对比远程 commit 与 `deploy/meta/*.deployed` 中记录的版本
-2. 无更新则跳过；有更新则 `git clone` → Maven/npm 构建 → 更新 `deploy/` → 重启服务
-3. 前提：**代码已 push 到 Gitee**（`BACKEND_REPO_URL` / `FRONTEND_REPO_URL`），且 B 机能访问该地址
+1. 每次执行均 `git clone` 前后端 → Maven/npm 构建 → 更新 `deploy/` → 重启服务（不跳过、不单独更新一端）
+2. 前提：**代码已 push 到 Gitee**（`BACKEND_REPO_URL` / `FRONTEND_REPO_URL`），且 B 机能访问该地址
 
-仅改了 `deploy.env`（如 API Key）时，不需要 deploy，执行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1 -SkipOcrWait
+powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1
 ```
-
-### 开发机同步代码到 Gitee
-
-B 机只从 Gitee 拉代码。开发机每次改完并 push 到 GitHub 后，**同时 push 到 Gitee**：
-
-```powershell
-# 后端
-cd E:\dev\Code\Java\landcheck\backend
-git push origin main
-git push gitee main
-
-# 前端
-cd E:\dev\Code\Java\landcheck\frontend
-git push origin main
-git push gitee main
-```
-
-若尚未添加 Gitee 远程：
-
-```powershell
-git remote add gitee https://gitee.com/wqhshuaige/land-backend.git   # 或 land-frontend.git
-```
-
----
-
-## B 机部署清单（无法访问 GitHub）
-
-1. 复制整个 `TestDeploy` 到 B 机（如 `D:\landcheck\TestDeploy`）
-2. 拷贝 Mongo 数据目录，修改 `deploy.env` 中的 `MONGO_DATA_DIR`、`LANDCHECK_LLM_API_KEY`、`LANDCHECK_LOG_DIR`
-3. 确认仓库地址（public 库无需令牌）：
-
-```env
-BACKEND_REPO_URL=https://gitee.com/wqhshuaige/land-backend.git
-FRONTEND_REPO_URL=https://gitee.com/wqhshuaige/land-frontend.git
-```
-
-4. 验证 B 机能访问 Gitee：
-
-```powershell
-git ls-remote https://gitee.com/wqhshuaige/land-backend.git HEAD
-git ls-remote https://gitee.com/wqhshuaige/land-frontend.git HEAD
-```
-
-5. 首次部署：
-
-```powershell
-cd D:\landcheck\TestDeploy
-powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-```
-
-6. 之后有更新时，先在开发机 push 到 Gitee，再在 B 机执行 `scripts\deploy.ps1`
-
----
 
 ## 开机自启（无人值守）
 
-一次性配置：
+推荐双击 `设置开机自启.bat`（会请求管理员权限）。登录后固定延迟 **2 分钟** 再启动服务（给 Docker Desktop 留启动时间）。
+
+一次性确认：
 
 1. Docker Desktop → Settings → **Start when you sign in**
-2. 管理员 PowerShell 执行：`scripts\install-autostart.ps1`
-3. 配置 Windows 自动登录，或约定重启后有人登录一次（计划任务在登录后触发）
-4. 重启后查看 `logs\boot-start.log`
+2. 配置 Windows 自动登录，或约定重启后有人登录一次（计划任务在登录后触发）
+3. 重启后查看 `logs\boot-start.log`
 
-取消自启：`scripts\uninstall-autostart.ps1`
-
-开机任务不等待 OCR 就绪（避免超时）；网站可先访问，OCR 约 5~10 分钟后可用。
+取消自启：双击 `取消开机自启.bat`（或 `scripts\uninstall-autostart.ps1`）
 
 ---
 

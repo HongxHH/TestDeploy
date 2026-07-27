@@ -97,15 +97,6 @@ function Get-GitShortRev {
     try { return (git rev-parse --short HEAD).Trim() } finally { Pop-Location }
 }
 
-function Get-RemoteShortRev {
-    param([Parameter(Mandatory = $true)][string]$RepoUrl, [Parameter(Mandatory = $true)][string]$Branch)
-    $hash = git ls-remote $RepoUrl "refs/heads/$Branch" 2>$null
-    if (-not $hash) { return $null }
-    $full = ($hash -split '\s+')[0]
-    if ($full.Length -ge 7) { return $full.Substring(0, 7) }
-    return $full
-}
-
 function Read-DeployedRev([string]$MetaFile) {
     if (-not (Test-Path $MetaFile)) { return $null }
     $line = Get-Content $MetaFile -TotalCount 1 -ErrorAction SilentlyContinue
@@ -209,8 +200,99 @@ function Test-LandcheckAutostartInstalled {
     if (Get-ScheduledTask -TaskName (Get-LandcheckAutostartTaskName) -ErrorAction SilentlyContinue) {
         return $true
     }
-    cmd /c "schtasks /Query /TN $(Get-LandcheckAutostartTaskName) >nul 2>nul"
-    return ($LASTEXITCODE -eq 0)
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    cmd /c "schtasks /Query /TN $(Get-LandcheckAutostartTaskName) >nul 2>nul" | Out-Null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    return ($code -eq 0)
+}
+
+function Remove-LandcheckAutostartTask {
+    $taskName = Get-LandcheckAutostartTaskName
+    if (-not (Test-LandcheckAutostartInstalled)) {
+        return @{ TaskName = $taskName; Existed = $false; Removed = $false }
+    }
+
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    # schtasks writes to stderr when missing; with ErrorAction Stop that becomes terminating.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    cmd /c "schtasks /Delete /TN `"$taskName`" /F >nul 2>&1" | Out-Null
+    $ErrorActionPreference = $prevEap
+
+    if (Test-LandcheckAutostartInstalled) {
+        throw "Failed to remove scheduled task: $taskName (try Run as Administrator)"
+    }
+    return @{ TaskName = $taskName; Existed = $true; Removed = $true }
+}
+
+# Ops mutex: block double-click / parallel rebuild+restart
+function Get-LandcheckOpsLockInfoPath {
+    $root = Get-DeployRoot
+    $dir = Join-Path $root '.work'
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return (Join-Path $dir 'ops.lock')
+}
+
+function Enter-LandcheckOpsLock {
+    param(
+        [Parameter(Mandatory = $true)][string]$Operation
+    )
+    $mutex = New-Object System.Threading.Mutex($false, 'Global\LandcheckTestDeployOps')
+    if (-not $mutex.WaitOne(0)) {
+        $hint = ''
+        $infoPath = Get-LandcheckOpsLockInfoPath
+        if (Test-Path $infoPath) {
+            $hint = ' ' + ((Get-Content $infoPath -Raw -ErrorAction SilentlyContinue) -replace '\s+', ' ').Trim()
+        }
+        $mutex.Dispose()
+        throw "Another ops task is running; please wait and retry.$hint"
+    }
+    $info = "operation=$Operation pid=$PID started=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    Set-Content -Path (Get-LandcheckOpsLockInfoPath) -Value $info -Encoding UTF8
+    return $mutex
+}
+
+function Exit-LandcheckOpsLock {
+    param($Mutex)
+    if ($null -eq $Mutex) { return }
+    try {
+        $infoPath = Get-LandcheckOpsLockInfoPath
+        if (Test-Path $infoPath) { Remove-Item $infoPath -Force -ErrorAction SilentlyContinue }
+        $Mutex.ReleaseMutex()
+    }
+    catch { }
+    finally {
+        $Mutex.Dispose()
+    }
+}
+
+function Request-LandcheckAdminElevation {
+    param([Parameter(Mandatory = $true)][string]$ScriptPath, [string[]]$ScriptArgs = @())
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        return $false
+    }
+    $argParts = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$ScriptPath`"") + $ScriptArgs
+    $argLine = ($argParts -join ' ')
+    try {
+        $proc = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argLine -Wait -PassThru
+    }
+    catch {
+        throw "UAC elevation cancelled or blocked: $($_.Exception.Message)"
+    }
+    if ($null -eq $proc) {
+        throw 'UAC elevation cancelled or failed to start elevated process'
+    }
+    $code = 1
+    if ($null -ne $proc.ExitCode) { $code = [int]$proc.ExitCode }
+    if ($code -ne 0) {
+        Write-ErrMsg "Elevated process failed (exit=$code). Details were in the Administrator PowerShell window."
+    }
+    exit $code
 }
 
 function Test-MongoReplicaSetReady {

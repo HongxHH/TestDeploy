@@ -46,7 +46,7 @@ if (-not $SkipConda) {
 Ensure-LandcheckDocker -Cfg $cfg -WaitOcr
 
 if (-not $SkipDeploy) {
-    & "$PSScriptRoot\deploy.ps1" -Force -SkipStart
+    & "$PSScriptRoot\deploy.ps1" -SkipStart
     if ($LASTEXITCODE -ne 0) { throw 'deploy 失败' }
 }
 

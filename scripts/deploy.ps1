@@ -1,24 +1,16 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-  从 Git 拉取源码 -> 构建 -> 拷贝产物 -> 删除源码 -> 重启服务。
-.PARAMETER Force
-  即使 commit 未变化也重新构建部署。
+  从 Git 拉取源码 -> 构建前后端 -> 拷贝产物 -> 删除源码 -> 重启服务。
+  每次执行均强制重新构建（前后端一并更新）。
 .PARAMETER SkipStart
   只构建产物，不启动后端和反代。
-.PARAMETER BackendOnly
-  仅部署后端。
-.PARAMETER FrontendOnly
-  仅部署前端。
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
 #>
 [CmdletBinding()]
 param(
-    [switch]$Force,
-    [switch]$SkipStart,
-    [switch]$BackendOnly,
-    [switch]$FrontendOnly
+    [switch]$SkipStart
 )
 
 Set-StrictMode -Version Latest
@@ -26,15 +18,8 @@ $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot\lib\DeployCommon.ps1"
 
-if ($BackendOnly -and $FrontendOnly) {
-    throw '不能同时指定 -BackendOnly 与 -FrontendOnly'
-}
-
 $cfg = Import-DeployConfig
 Ensure-DeployDirs $cfg
-
-$deployBackend = -not $FrontendOnly
-$deployFrontend = -not $BackendOnly
 
 function Prepare-SourceTree {
     param(
@@ -118,30 +103,14 @@ function Build-Frontend {
 Write-Host 'landcheck 一键部署' -ForegroundColor White
 Write-Host "根目录: $($cfg.DEPLOY_ROOT)" -ForegroundColor DarkGray
 
-if (-not $Force) {
-    $updateScript = Join-Path $PSScriptRoot 'check-updates.ps1'
-    & $updateScript -Json | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Ok '版本未变化，跳过部署（使用 -Force 强制重建）'
-        exit 0
-    }
-    if ($LASTEXITCODE -eq 1) {
-        throw '更新检测失败，请检查 deploy.env 或 Git 网络'
-    }
-}
-
 try {
-    if ($deployBackend) {
-        $backendTree = Prepare-SourceTree -Kind 'backend' -RepoUrl $cfg.BACKEND_REPO_URL
-        Build-Backend -SourcePath (Get-SourceTreePath -Tree $backendTree)
-        Save-DeployedMeta -MetaDir $cfg.DEPLOY_META_DIR -Name 'backend' -Commit $backendTree['short'] -FullCommit $backendTree['full'] -Source $backendTree['source']
-    }
+    $backendTree = Prepare-SourceTree -Kind 'backend' -RepoUrl $cfg.BACKEND_REPO_URL
+    Build-Backend -SourcePath (Get-SourceTreePath -Tree $backendTree)
+    Save-DeployedMeta -MetaDir $cfg.DEPLOY_META_DIR -Name 'backend' -Commit $backendTree['short'] -FullCommit $backendTree['full'] -Source $backendTree['source']
 
-    if ($deployFrontend) {
-        $frontendTree = Prepare-SourceTree -Kind 'frontend' -RepoUrl $cfg.FRONTEND_REPO_URL
-        Build-Frontend -SourcePath (Get-SourceTreePath -Tree $frontendTree)
-        Save-DeployedMeta -MetaDir $cfg.DEPLOY_META_DIR -Name 'frontend' -Commit $frontendTree['short'] -FullCommit $frontendTree['full'] -Source $frontendTree['source']
-    }
+    $frontendTree = Prepare-SourceTree -Kind 'frontend' -RepoUrl $cfg.FRONTEND_REPO_URL
+    Build-Frontend -SourcePath (Get-SourceTreePath -Tree $frontendTree)
+    Save-DeployedMeta -MetaDir $cfg.DEPLOY_META_DIR -Name 'frontend' -Commit $frontendTree['short'] -FullCommit $frontendTree['full'] -Source $frontendTree['source']
 }
 finally {
     Write-Step '清理临时源码 (.work)'
@@ -154,10 +123,8 @@ Write-Ok '源码已删除，仅保留 deploy/ 产物'
 
 if (-not $SkipStart) {
     Ensure-LandcheckDocker -Cfg $cfg -WaitOcr
-    if ($deployBackend) {
-        Start-LandcheckBackend -Cfg $cfg
-        Wait-BackendHealthy -Cfg $cfg
-    }
+    Start-LandcheckBackend -Cfg $cfg
+    Wait-BackendHealthy -Cfg $cfg
     Wait-ProxyHealthy -Cfg $cfg
 }
 
