@@ -1,0 +1,159 @@
+name: landcheck
+
+configs:
+  broker_conf:
+    content: |
+      brokerClusterName = DefaultCluster
+      brokerName = broker-a
+      brokerId = 0
+      deleteWhen = 04
+      fileReservedTime = 48
+      brokerRole = ASYNC_MASTER
+      flushDiskType = ASYNC_FLUSH
+      autoCreateTopicEnable = true
+      brokerIP1 = 127.0.0.1
+      namesrvAddr = rmqnamesrv:9876
+
+  caddyfile:
+    content: |
+      :8090 {
+        route {
+          handle /api/* {
+            uri strip_prefix /api
+            reverse_proxy host.docker.internal:8082
+          }
+          handle {
+            encode gzip
+            root * /srv/frontend
+            try_files {path} {path}/ /index.html
+            file_server
+          }
+        }
+      }
+
+services:
+  mongodb:
+    image: mongo:8.0.13
+    container_name: mongodb
+    restart: always
+    command: --replSet rs0 --bind_ip_all --port 27017
+    ports:
+      - "27017:27017"
+    volumes:
+      - ${MONGO_DATA_DIR}:/data/db
+    environment:
+      TZ: Asia/Shanghai
+
+  redis:
+    image: redis:8.2.1
+    container_name: landcheck-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    command: redis-server --bind 0.0.0.0 --port 6379 --requirepass 123 --appendonly yes
+    environment:
+      TZ: Asia/Shanghai
+
+  rmqnamesrv:
+    image: apache/rocketmq:5.1.0
+    container_name: landcheck-rmqnamesrv
+    restart: always
+    privileged: true
+    networks:
+      - rocketmq
+    ports:
+      - "9876:9876"
+    volumes:
+      - ./data/rocketmq/nameserver/logs:/home/rocketmq/logs
+    command: sh mqnamesrv
+    environment:
+      TZ: Asia/Shanghai
+
+  rmqbroker:
+    image: apache/rocketmq:5.1.0
+    container_name: landcheck-rmqbroker
+    restart: always
+    privileged: true
+    networks:
+      - rocketmq
+    depends_on:
+      - rmqnamesrv
+    ports:
+      - "10911:10911"
+      - "10909:10909"
+    volumes:
+      - ./data/rocketmq/broker/logs:/root/logs
+      - ./data/rocketmq/broker/store:/root/store
+    configs:
+      - source: broker_conf
+        target: /home/rocketmq/broker.conf
+    environment:
+      TZ: Asia/Shanghai
+      NAMESRV_ADDR: rmqnamesrv:9876
+    command: sh mqbroker -c /home/rocketmq/broker.conf
+
+  landcheck-proxy:
+    image: caddy:2-alpine
+    container_name: landcheck-proxy
+    restart: always
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./deploy/frontend/dist:/srv/frontend:ro
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # OCR 文件解析
+  paddleocr-vlm-server:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:paddleocr3.6-nvidia-gpu-sm120-offline
+    container_name: paddleocr-vlm-server
+    restart: always
+    shm_size: 64g
+    user: root
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ "0" ]
+              capabilities: [ gpu ]
+    command: paddleocr genai_server --model_name PaddleOCR-VL-1.6-0.9B --host 0.0.0.0 --port 8080 --backend vllm
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8080/health || exit 1" ]
+      start_period: 300s
+
+  paddleocr-vl-api:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:paddleocr3.6-nvidia-gpu-sm120-offline
+    container_name: paddleocr-vl-api
+    restart: always
+    ports:
+      - "8080:8080"
+    shm_size: 64g
+    user: root
+    depends_on:
+      paddleocr-vlm-server:
+        condition: service_healthy
+    volumes:
+      - ./config/pipeline_config_vllm.yaml:/home/paddleocr/pipeline_config_vllm.yaml
+    environment:
+      VLM_BACKEND: vllm
+      DISABLE_MODEL_SOURCE_CHECK: "True"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ "0" ]
+              capabilities: [ gpu ]
+    command: /bin/bash -c "paddlex --serve --pipeline /home/paddleocr/pipeline_config_vllm.yaml"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8080/health || exit 1" ]
+
+networks:
+  rocketmq:
+    name: landcheck-rocketmq

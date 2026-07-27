@@ -1,0 +1,15 @@
+# Conda 环境 SR — 供后端 PDF 预处理 pdf_preprocessor.py 使用
+# 安装：scripts\setup-conda.ps1
+# 或手动：conda env create -f conda/environment.yml
+name: SR
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy>=1.24
+  - scipy>=1.11
+  - pillow>=10.0
+  - pip
+  - pip:
+      - pymupdf>=1.24.0
+      - opencv-python-headless>=4.8.0
