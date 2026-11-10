@@ -71,12 +71,14 @@ function Build-Backend {
 
     if (-not $jar) { throw '未找到 lc-start-*.jar 构建产物' }
 
-    $targetJar = Join-Path $cfg.DEPLOY_BACKEND_DIR 'lc-start.jar'
-    Copy-Item $jar.FullName $targetJar -Force
-    if (-not (Test-JarContainsResource -JarPath $targetJar -ResourceName 'pdf_preprocessor.py')) {
+    # 先写到 staging：等前后端构建完成后再停服务并替换正式 JAR，缩短停机窗口
+    $stagingJar = Join-Path $cfg.DEPLOY_BACKEND_DIR 'lc-start.jar.staging'
+    Copy-Item -LiteralPath $jar.FullName -Destination $stagingJar -Force
+    if (-not (Test-JarContainsResource -JarPath $stagingJar -ResourceName 'pdf_preprocessor.py')) {
         throw 'JAR 内缺少 pdf_preprocessor.py，请确认后端 Git 仓库已包含该文件并重新构建'
     }
-    Write-Ok "JAR 已部署: $targetJar"
+    Write-Ok "JAR 已构建并暂存: $stagingJar"
+    return $stagingJar
 }
 
 function Build-Frontend {
@@ -103,9 +105,10 @@ function Build-Frontend {
 Write-Host 'landcheck 一键部署' -ForegroundColor White
 Write-Host "根目录: $($cfg.DEPLOY_ROOT)" -ForegroundColor DarkGray
 
+$stagingJar = $null
 try {
     $backendTree = Prepare-SourceTree -Kind 'backend' -RepoUrl $cfg.BACKEND_REPO_URL
-    Build-Backend -SourcePath (Get-SourceTreePath -Tree $backendTree)
+    $stagingJar = Build-Backend -SourcePath (Get-SourceTreePath -Tree $backendTree)
     Save-DeployedMeta -MetaDir $cfg.DEPLOY_META_DIR -Name 'backend' -Commit $backendTree['short'] -FullCommit $backendTree['full'] -Source $backendTree['source']
 
     $frontendTree = Prepare-SourceTree -Kind 'frontend' -RepoUrl $cfg.FRONTEND_REPO_URL
@@ -118,6 +121,14 @@ finally {
         Remove-Item $cfg.WORK_DIR -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+if (-not $stagingJar -or -not (Test-Path $stagingJar)) {
+    throw '未找到暂存 JAR，后端构建可能失败'
+}
+
+# 构建已完成后再停服务并替换正式 JAR（禁止运行中热覆盖）
+Publish-LandcheckBackendJar -Cfg $cfg -SourceJar $stagingJar
+Remove-Item -LiteralPath $stagingJar -Force -ErrorAction SilentlyContinue
 
 Write-Ok '源码已删除，仅保留 deploy/ 产物'
 

@@ -408,19 +408,130 @@ function Stop-LandcheckDocker([hashtable]$Cfg) {
     Write-Ok 'Docker 容器已停止'
 }
 
-function Stop-LandcheckBackend([hashtable]$Cfg) {
-    $pidFile = Join-Path $Cfg['DEPLOY_BACKEND_DIR'] 'backend.pid'
-    if (-not (Test-Path $pidFile)) { Write-WarnMsg '未找到 backend.pid'; return }
-    $backendPid = [int](Get-Content $pidFile -TotalCount 1)
-    if ($backendPid -le 0) { return }
-    $proc = Get-Process -Id $backendPid -ErrorAction SilentlyContinue
-    if ($proc) {
-        Write-Step "停止后端 PID=$backendPid"
-        Stop-Process -Id $backendPid -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-        Write-Ok '后端已停止'
+function Get-PidsListeningOnPort {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    $pids = New-Object 'System.Collections.Generic.HashSet[int]'
+    try {
+        Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop |
+            ForEach-Object { if ($_.OwningProcess -gt 0) { [void]$pids.Add([int]$_.OwningProcess) } }
     }
+    catch {
+        # Fallback when Get-NetTCPConnection is unavailable / needs elevation
+        $lines = @(netstat -ano -p tcp 2>$null)
+        foreach ($line in $lines) {
+            if ($line -notmatch 'LISTENING') { continue }
+            if ($line -notmatch (":$Port\s+")) { continue }
+            if ($line -match '\s+(\d+)\s*$') {
+                $pidVal = [int]$Matches[1]
+                if ($pidVal -gt 0) { [void]$pids.Add($pidVal) }
+            }
+        }
+    }
+    return @($pids)
+}
+
+function Get-LandcheckBackendJavaPids {
+    param([Parameter(Mandatory = $true)][hashtable]$Cfg)
+    $jarName = 'lc-start.jar'
+    $jarPath = (Join-Path $Cfg['DEPLOY_BACKEND_DIR'] $jarName)
+    $pids = New-Object 'System.Collections.Generic.HashSet[int]'
+    try {
+        Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" -ErrorAction Stop | ForEach-Object {
+            $cmd = [string]$_.CommandLine
+            if ([string]::IsNullOrWhiteSpace($cmd)) { return }
+            if ($cmd -like "*$jarName*" -or ($cmd -like "*$jarPath*")) {
+                [void]$pids.Add([int]$_.ProcessId)
+            }
+        }
+    }
+    catch {
+        Write-WarnMsg "无法枚举 java 进程命令行: $($_.Exception.Message)"
+    }
+    return @($pids)
+}
+
+function Wait-BackendPortFree {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Cfg,
+        [int]$TimeoutSec = 30
+    )
+    $port = [int]$Cfg['BACKEND_PORT']
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $holders = @(Get-PidsListeningOnPort -Port $port)
+        if ($holders.Count -eq 0) { return }
+        Start-Sleep -Seconds 1
+    }
+    $left = @(Get-PidsListeningOnPort -Port $port)
+    throw "端口 $port 仍被占用 (PID=$($left -join ',')), 无法安全替换 JAR / 启动后端"
+}
+
+function Stop-LandcheckBackend([hashtable]$Cfg) {
+    Write-Step '停止后端'
+    $pidFile = Join-Path $Cfg['DEPLOY_BACKEND_DIR'] 'backend.pid'
+    $targets = New-Object 'System.Collections.Generic.HashSet[int]'
+
+    if (Test-Path $pidFile) {
+        $raw = (Get-Content $pidFile -TotalCount 1)
+        $backendPid = 0
+        if ([int]::TryParse(([string]$raw).Trim(), [ref]$backendPid) -and $backendPid -gt 0) {
+            [void]$targets.Add($backendPid)
+        }
+    }
+    else {
+        Write-WarnMsg '未找到 backend.pid，将按端口/命令行兜底查杀'
+    }
+
+    foreach ($pidVal in (Get-LandcheckBackendJavaPids -Cfg $Cfg)) { [void]$targets.Add([int]$pidVal) }
+    foreach ($pidVal in (Get-PidsListeningOnPort -Port ([int]$Cfg['BACKEND_PORT']))) { [void]$targets.Add([int]$pidVal) }
+
+    if ($targets.Count -eq 0) {
+        Write-Ok '后端未在运行'
+        Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    foreach ($pidVal in @($targets)) {
+        $proc = Get-Process -Id $pidVal -ErrorAction SilentlyContinue
+        if (-not $proc) { continue }
+        Write-Host "  kill PID=$pidVal ($($proc.ProcessName))" -ForegroundColor DarkGray
+        Stop-Process -Id $pidVal -Force -ErrorAction SilentlyContinue
+    }
+
+    Wait-BackendPortFree -Cfg $Cfg -TimeoutSec 30
     Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+    Write-Ok '后端已停止，端口已释放'
+}
+
+function Publish-LandcheckBackendJar {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Cfg,
+        [Parameter(Mandatory = $true)][string]$SourceJar
+    )
+    if (-not (Test-Path $SourceJar)) { throw "源 JAR 不存在: $SourceJar" }
+
+    # 必须先停稳再覆盖，避免运行中替换 fat jar 导致嵌套类 ClassNotFound
+    Stop-LandcheckBackend -Cfg $Cfg
+
+    $targetJar = Join-Path $Cfg['DEPLOY_BACKEND_DIR'] 'lc-start.jar'
+    $tmpJar = Join-Path $Cfg['DEPLOY_BACKEND_DIR'] ('lc-start.jar.new.' + [guid]::NewGuid().ToString('N'))
+    Write-Step "发布 JAR -> $targetJar"
+    try {
+        Copy-Item -LiteralPath $SourceJar -Destination $tmpJar -Force
+        if (Test-Path $targetJar) {
+            Remove-Item -LiteralPath $targetJar -Force -ErrorAction Stop
+        }
+        Move-Item -LiteralPath $tmpJar -Destination $targetJar -Force
+    }
+    catch {
+        Remove-Item -LiteralPath $tmpJar -Force -ErrorAction SilentlyContinue
+        throw "无法替换 $targetJar（文件可能仍被占用）: $($_.Exception.Message)"
+    }
+
+    if (-not (Test-JarContainsResource -JarPath $targetJar -ResourceName 'pdf_preprocessor.py')) {
+        throw 'JAR 内缺少 pdf_preprocessor.py，请确认后端 Git 仓库已包含该文件并重新构建'
+    }
+    Write-Ok "JAR 已发布: $targetJar"
 }
 
 function Start-LandcheckBackend([hashtable]$Cfg) {

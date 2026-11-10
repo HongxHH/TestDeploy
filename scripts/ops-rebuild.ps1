@@ -21,7 +21,8 @@ try {
     Write-Host ' landcheck rebuild' -ForegroundColor White
     Write-Host '========================================' -ForegroundColor White
 
-    Write-Step 'Stop backend (avoid JAR replace conflict)'
+    # deploy.ps1 / Publish-LandcheckBackendJar 会再次确保停稳后再换 JAR
+    Write-Step 'Stop backend before rebuild'
     Stop-LandcheckBackend -Cfg $cfg
 
     & "$PSScriptRoot\deploy.ps1"
